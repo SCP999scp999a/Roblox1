@@ -266,4 +266,4 @@ async def roblox_lookup(ctx, *, username):
         await ctx.send(f'❌ **{user_mention}** เกิดข้อผิดพลาด: `{str(e)[:1000]}`')
 
 bot.run(TOKEN)
-        
+    
