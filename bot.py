@@ -1,271 +1,373 @@
-import os
 import discord
+from discord import app_commands
 from discord.ext import commands
 import aiohttp
 import asyncio
-from datetime import datetime
+import time
+import re
+from collections import deque
+
+import os
 
 TOKEN = os.environ.get("TOKEN")
-ALLOWED_CHANNEL_ID = 1467416456286179470
+ADMIN_ID = 1226204034944339968
 
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+def is_valid_webhook(url):
+    webhook_pattern = r'^https://discord\.com/api/webhooks/\d+/[\w-]+$'
+    return re.match(webhook_pattern, url) is not None
+
+class MainMenu(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🚀 ส่ง Webhook", style=discord.ButtonStyle.green, emoji="⚡")
+    async def send_webhook_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(WebhookModal())
+
+    @discord.ui.button(label="📞 ติดต่อแอดมิน", style=discord.ButtonStyle.blurple, emoji="👤")
+    async def contact_admin(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # ดึงข้อมูลแอดมินแบบ full (รวม banner)
+        try:
+            admin = await interaction.client.fetch_user(ADMIN_ID)
+        except Exception:
+            admin = interaction.client.get_user(ADMIN_ID)
+
+        embed = discord.Embed(
+            title="",
+            description=(
+                f"## 👑 ข้อมูลแอดมิน\n"
+                f"╔══════════════════════╗\n"
+                f"**ชื่อ** ┃ {admin.name if admin else 'แอดมิน'}\n"
+                f"**ไอดี** ┃ `{ADMIN_ID}`\n"
+                f"╚══════════════════════╝\n\n"
+                f"💬 กดปุ่มด้านล่างเพื่อเปิดโปรไฟล์และส่งข้อความหาแอดมินได้เลย!"
+            ),
+            color=0x5865F2  # Discord Blurple
+        )
+
+        # ใส่รูป GIF สวยๆ เป็น image หลัก
+        embed.set_image(url="https://cdn.discordapp.com/attachments/1427659460679045303/1475165371383287940/standard.gif?ex=69a3be8f&is=69a26d0f&hm=f37ce17634010b09cba07f0c7b779ad4a5ed68504c2e943de2781c1cab0ededa")
+
+        # ใส่รูปโปรไฟล์แอดมินเป็น thumbnail มุมขวา
+        if admin and admin.avatar:
+            embed.set_thumbnail(url=admin.display_avatar.with_size(256).url)
+
+        embed.set_footer(
+            text="คลิกปุ่มด้านล่าง → เปิดโปรไฟล์ Discord โดยตรง",
+            icon_url=admin.display_avatar.url if admin else None
+        )
+
+        # View มีปุ่ม link ตรงไปโปรไฟล์ — Discord จะเด้งเปิดโปรไฟล์ทันที
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(
+            label="🔗 เปิดโปรไฟล์แอดมิน",
+            style=discord.ButtonStyle.link,
+            url=f"https://discord.com/users/{ADMIN_ID}",
+            emoji="👤"
+        ))
+        view.add_item(discord.ui.Button(
+            label="✉️ ส่งข้อความ",
+            style=discord.ButtonStyle.link,
+            url=f"https://discord.com/users/{ADMIN_ID}",
+            emoji="💬"
+        ))
+
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class WebhookModal(discord.ui.Modal, title="⚡ ตั้งค่าส่ง Webhook"):
+
+    webhook_url = discord.ui.TextInput(
+        label="🔗 ลิงก์ Webhook",
+        placeholder="https://discord.com/api/webhooks/...",
+        style=discord.TextStyle.short,
+        required=True
+    )
+    message_words = discord.ui.TextInput(
+        label="💬 ข้อความ (เว้นวรรคเพื่อแยกคำ)",
+        placeholder="สวัสดี ทดสอบ บอท Discord",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+    amount = discord.ui.TextInput(
+        label="🔢 จำนวนครั้ง (สูงสุด 2000)",
+        placeholder="1000",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=4
+    )
+    speed_mode = discord.ui.TextInput(
+        label="🎮 เลือกโหมดความเร็ว (1, 2, 3)",
+        placeholder="1 = เร็ว | 2 = เร็วมาก | 3 = เร็วดิสพัง",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=1
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # ตรวจสอบ Webhook URL
+        if not is_valid_webhook(self.webhook_url.value):
+            embed = discord.Embed(title="❌ Webhook URL ไม่ถูกต้อง", color=discord.Color.red())
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # ตรวจสอบ Webhook ว่าใช้งานได้
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.webhook_url.value, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        embed = discord.Embed(title="❌ Webhook นี้ใช้งานไม่ได้", color=discord.Color.red())
+                        await interaction.response.send_message(embed=embed, ephemeral=True)
+                        return
+        except Exception:
+            embed = discord.Embed(title="❌ ไม่สามารถเชื่อมต่อ Webhook ได้", color=discord.Color.red())
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # ตรวจสอบจำนวนครั้ง
+        try:
+            amount = int(self.amount.value)
+            if not (1 <= amount <= 2000):
+                raise ValueError
+        except ValueError:
+            embed = discord.Embed(title="❌ จำนวนครั้งไม่ถูกต้อง (1-2000)", color=discord.Color.red())
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # ตรวจสอบโหมดความเร็ว
+        speed_choice = self.speed_mode.value.strip()
+        speed_settings = {
+            "1": (0.5,  5,  "🚀 เร็ว",       discord.Color.green(),    "🚀"),
+            "2": (0.2, 10,  "⚡ เร็วมาก",     discord.Color.gold(),     "⚡"),
+            "3": (0.05, 20, "💥 เร็วดิสพัง",  discord.Color.dark_red(), "💥"),
+        }
+        if speed_choice not in speed_settings:
+            embed = discord.Embed(title="❌ เลือกโหมดผิด (1, 2 หรือ 3)", color=discord.Color.red())
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        delay, concurrency, mode_name, color, speed_emoji = speed_settings[speed_choice]
+
+        words = self.message_words.value.split()
+        if not words:
+            embed = discord.Embed(title="❌ ไม่มีข้อความ", color=discord.Color.red())
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        # แสดงสถานะเริ่มต้น
+        status_embed = discord.Embed(
+            title=f"{speed_emoji} {mode_name} — กำลังเตรียมส่ง...",
+            description=f"```\nจำนวนครั้ง : {amount:,}\nโหมด       : {mode_name}\nConcurrency: {concurrency}\nDelay      : {delay*1000:.0f} ms\n```",
+            color=color
+        )
+        status_embed.set_footer(text=f"เริ่มส่งโดย: {interaction.user.name}")
+        await interaction.response.send_message(embed=status_embed, ephemeral=True)
+
+        # ---- ส่ง Webhook จริง ----
+        success_count = 0
+        fail_count = 0
+        start_time = time.time()
+        semaphore = asyncio.Semaphore(concurrency)
+        lock = asyncio.Lock()
+        last_edit_time = [0.0]  # ใช้ list เพื่อให้แก้ค่าใน closure ได้
+
+        timeout = aiohttp.ClientTimeout(total=10, connect=3)
+        connector = aiohttp.TCPConnector(limit=concurrency + 5, ttl_dns_cache=300)
+
+        async def send_one(session: aiohttp.ClientSession, word: str):
+            nonlocal success_count, fail_count
+            async with semaphore:
+                retries = 3
+                for attempt in range(retries):
+                    try:
+                        async with session.post(
+                            self.webhook_url.value,
+                            json={"content": word}
+                        ) as resp:
+                            if resp.status in (200, 204):
+                                async with lock:
+                                    success_count += 1
+                                return
+                            elif resp.status == 429:
+                                retry_after = float(resp.headers.get("Retry-After", "1"))
+                                await asyncio.sleep(min(retry_after, 5))
+                                continue
+                            else:
+                                # อื่นๆ รอแล้ว retry
+                                await asyncio.sleep(0.5)
+                                continue
+                    except asyncio.TimeoutError:
+                        await asyncio.sleep(0.3)
+                        continue
+                    except Exception:
+                        await asyncio.sleep(0.3)
+                        continue
+                # หมด retry
+                async with lock:
+                    fail_count += 1
+
+        async def progress_updater():
+            """อัพเดท embed ทุก 1.5 วินาที"""
+            progress_chars = 20
+            while True:
+                await asyncio.sleep(1.5)
+                completed = success_count + fail_count
+                if completed == 0:
+                    continue
+                elapsed = time.time() - start_time
+                progress = completed / amount
+                speed = completed / elapsed if elapsed > 0 else 0
+                filled = int(progress * progress_chars)
+                bar = "█" * filled + "░" * (progress_chars - filled)
+
+                status_embed.title = f"{speed_emoji} {mode_name} — กำลังส่ง..."
+                status_embed.description = (
+                    f"**[{bar}] {progress*100:.1f}%**\n"
+                    f"```\n"
+                    f"ส่งแล้ว  : {completed:,} / {amount:,}\n"
+                    f"สำเร็จ   : {success_count:,}\n"
+                    f"ล้มเหลว  : {fail_count:,}\n"
+                    f"เวลา     : {elapsed:.1f} วิ\n"
+                    f"ความเร็ว : {speed:.1f} ครั้ง/วิ\n"
+                    f"```"
+                )
+                try:
+                    await interaction.edit_original_response(embed=status_embed)
+                except Exception:
+                    pass
+                if completed >= amount:
+                    break
+
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            # สร้าง tasks ทั้งหมด
+            tasks = [
+                asyncio.create_task(send_one(session, words[i % len(words)]))
+                for i in range(amount)
+            ]
+
+            # เพิ่ม delay ระหว่าง task ถ้าเลือกโหมดช้า (เพื่อป้องกัน rate limit)
+            # ส่ง tasks ด้วย gather แต่ throttle ด้วย semaphore ที่กำหนดไว้แล้ว
+            updater_task = asyncio.create_task(progress_updater())
+
+            # เพิ่ม delay ระหว่าง launch tasks เพื่อ spread การส่ง
+            async def launch_tasks():
+                chunk = max(1, concurrency)
+                for i in range(0, len(tasks), chunk):
+                    await asyncio.gather(*tasks[i:i+chunk])
+                    await asyncio.sleep(delay)
+
+            await launch_tasks()
+            updater_task.cancel()
+
+        # ---- สรุปผล ----
+        elapsed_time = time.time() - start_time
+        avg_speed = amount / elapsed_time if elapsed_time > 0 else 0
+
+        if avg_speed >= 100:
+            rating = "💥 โคตรเร็ว"
+        elif avg_speed >= 50:
+            rating = "⚡ เร็วมาก"
+        elif avg_speed >= 20:
+            rating = "🚀 เร็ว"
+        else:
+            rating = "🐢 ปกติ"
+
+        success_rate = success_count / amount * 100
+
+        result_embed = discord.Embed(
+            title=f"{speed_emoji} ส่ง Webhook เสร็จสิ้น!",
+            description=(
+                f"```\n"
+                f"ส่งทั้งหมด   : {amount:,} ครั้ง\n"
+                f"สำเร็จ       : {success_count:,} ({success_rate:.1f}%)\n"
+                f"ล้มเหลว      : {fail_count:,} ({100-success_rate:.1f}%)\n"
+                f"เวลาที่ใช้   : {elapsed_time:.2f} วิ\n"
+                f"ความเร็วเฉลี่ย: {avg_speed:.1f} ครั้ง/วิ\n"
+                f"เรตติ้ง      : {rating}\n"
+                f"```"
+            ),
+            color=discord.Color.green() if success_rate >= 90 else discord.Color.orange()
+        )
+
+        if fail_count > 0:
+            result_embed.add_field(
+                name="💡 เคล็ดลับ",
+                value="• ลองลดโหมดความเร็วถ้าส่งไม่สำเร็จเยอะ\n• Discord rate limit ประมาณ 30 req/วิ ต่อ webhook",
+                inline=False
+            )
+
+        try:
+            await interaction.edit_original_response(embed=result_embed)
+        except Exception:
+            pass
+
+
+def make_menu_embed(name: str, avatar_url: str | None) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎮 ระบบส่ง Webhook ความเร็วสูง",
+        description=(
+            "```\nส่งไวขึ้น ไม่ค้าง ไม่ล้มเหลว!\n```\n\n"
+            "**🚀 ปุ่มเมนู:**\n"
+            "⚡ **ส่ง Webhook** — เปิดฟอร์มกรอกข้อมูล\n"
+            "👤 **ติดต่อแอดมิน** — ดูข้อมูลติดต่อแอดมิน\n\n"
+            "**🎮 โหมดความเร็ว:**\n"
+            "```\n"
+            "[1] 🚀 เร็ว       : concurrency  5  delay 500ms\n"
+            "[2] ⚡ เร็วมาก    : concurrency 10  delay 200ms\n"
+            "[3] 💥 เร็วดิสพัง : concurrency 20  delay  50ms\n"
+            "```\n"
+            "✨ **ปรับปรุงแล้ว:**\n"
+            "• Retry อัตโนมัติ 3 ครั้งต่อข้อความ\n"
+            "• จัดการ Rate-limit (429) อัตโนมัติ\n"
+            "• Progress bar อัพเดทแบบ real-time\n"
+            "• รองรับสูงสุด 2,000 ครั้ง"
+        ),
+        color=discord.Color.purple()
+    )
+    embed.set_image(url="https://cdn.discordapp.com/attachments/1427659460679045303/1475165371383287940/standard.gif?ex=69a3be8f&is=69a26d0f&hm=f37ce17634010b09cba07f0c7b779ad4a5ed68504c2e943de2781c1cab0ededa")
+    if avatar_url:
+        embed.set_thumbnail(url=avatar_url)
+    embed.set_footer(text=f"เรียกใช้โดย: {name} | สูงสุด 2,000 ครั้ง")
+    return embed
+
+
+@bot.command(name="ssd")
+async def prefix_ssd(ctx):
+    avatar = ctx.bot.user.avatar.url if ctx.bot.user.avatar else None
+    await ctx.send(embed=make_menu_embed(ctx.author.name, avatar), view=MainMenu())
+
+
+@tree.command(name="ssd", description="📋 เปิดเมนูระบบส่ง Webhook")
+async def slash_ssd(interaction: discord.Interaction):
+    avatar = interaction.client.user.avatar.url if interaction.client.user.avatar else None
+    await interaction.response.send_message(
+        embed=make_menu_embed(interaction.user.name, avatar),
+        view=MainMenu()
+    )
+
 
 @bot.event
 async def on_ready():
-    print(f'{bot.user} เชื่อมต่อแล้ว! ใช้ !c <ชื่อRoblox>')
-    print(f'📢 ทำงานเฉพาะช่อง ID: {ALLOWED_CHANNEL_ID}')
-
-def format_date(created):
-    months_th = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
-                 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม']
+    print(f"✅ บอทออนไลน์แล้ว: {bot.user}")
+    print(f"🆔 บอท ID: {bot.user.id}")
+    print(f"🌐 เซิร์ฟเวอร์: {len(bot.guilds)} แห่ง")
     try:
-        dt = datetime.fromisoformat(created.replace('Z', '+00:00'))
-        day = dt.day
-        month = months_th[dt.month-1]
-        year = dt.year + 543
-        return f"{day} {month} {year}"
-    except:
-        return 'ไม่ทราบ'
-
-async def get_profile_image(user_id):
-    thumbnail_url = f"https://thumbnails.roblox.com/v1/users/avatar-headshot"
-    params = {
-        'userIds': str(user_id),
-        'size': '420x420',
-        'format': 'Png',
-        'isCircular': 'false'
-    }
-    async with aiohttp.ClientSession() as session:
-        for attempt in range(5):
-            try:
-                async with session.get(thumbnail_url, params=params) as resp:
-                    data = await resp.json()
-                    if data.get('data') and len(data['data']) > 0 and data['data'][0].get('imageUrl'):
-                        return data['data'][0]['imageUrl']
-                await asyncio.sleep(0.5)
-            except:
-                await asyncio.sleep(0.5)
-    return f"https://www.roblox.com/headshot-thumbnail/image?userId={user_id}&width=420&height=420&format=png"
-
-async def get_avatar_cost(user_id):
-    """ดึงแต่งตัวหน้าโปรไฟล์ + คำนวณราคา Robux"""
-    try:
-        avatar_url = f'https://avatar.roblox.com/v1/users/{user_id}/avatar'
-        async with aiohttp.ClientSession() as session:
-            async with session.get(avatar_url) as resp:
-                avatar_data = await resp.json()
-
-        assets = avatar_data.get('assets', [])
-        total_cost = 0
-        asset_list = []
-
-        for asset in assets[:8]:
-            asset_id = asset.get('id')
-            asset_name = asset.get('name', 'ไม่ทราบชื่อ')
-            asset_type = asset.get('assetType', {})
-            asset_type_name = asset_type.get('name', 'อื่นๆ')
-
-            price = await get_asset_price(asset_id)
-            total_cost += price if price and price > 0 else 0
-
-            asset_list.append(f"**{asset_name[:30]}** ({asset_type_name})")
-
-        if not asset_list:
-            return "ไม่มีข้อมูลแต่งตัว", 0
-
-        return '\n'.join(asset_list), total_cost
-
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        print("✅ ซิงค์คำสั่งเสร็จสิ้น")
     except Exception as e:
-        print(f"Error get_avatar_cost: {e}")
-        return "ไม่สามารถดึงแต่งตัวได้", 0
-
-async def get_asset_price(asset_id):
-    """ดึงราคา asset เดี่ยว"""
-    try:
-        catalog_url = f'https://economy.roblox.com/v2/assets/{asset_id}/details'
-        async with aiohttp.ClientSession() as session:
-            async with session.get(catalog_url) as resp:
-                data = await resp.json()
-                
-                price = data.get('PriceInRobux') or 0
-                
-                if data.get('LowestResalePrice'):
-                    price = data.get('LowestResalePrice')
-                
-                return price
-    except Exception as e:
-        print(f"Error get_asset_price: {e}")
-        return 0
-
-async def get_robux(user_id):
-    """ดึง Robux + Premium"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            # ดึง Robux (อาจไม่ได้ผลถ้าไม่มี authentication)
-            try:
-                currency_url = f'https://economy.roblox.com/v1/users/{user_id}/currency'
-                async with session.get(currency_url) as resp:
-                    data = await resp.json()
-                    robux = data.get('robux', 0)
-            except:
-                robux = 0
-
-            # ตรวจสอบ Premium
-            try:
-                premium_url = f'https://premiumfeatures.roblox.com/v1/users/{user_id}/validate-membership'
-                async with session.get(premium_url) as premium_resp:
-                    premium_data = await premium_resp.json()
-                    is_premium = premium_data.get('isPremium', False)
-            except:
-                is_premium = False
-
-            if robux > 0:
-                return f"`{robux:,}` {'👑 Premium' if is_premium else ''}"
-            else:
-                return f"ไม่สามารถดูได้ {'👑 Premium' if is_premium else ''}"
-    except:
-        return "ไม่สามารถดึงข้อมูล"
-
-async def check_channel(ctx):
-    if ctx.channel.id != ALLOWED_CHANNEL_ID:
-        embed = discord.Embed(
-            title="❌ คำสั่งนี้ใช้ได้เฉพาะช่องที่กำหนด!",
-            description=f"**ใช้คำสั่งในช่อง** <#{ALLOWED_CHANNEL_ID}> เท่านั้น\n`!c <ชื่อRoblox>`",
-            color=0xff0000
+        print(f"⚠️ ไม่สามารถซิงค์คำสั่ง: {e}")
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name="⚡ !ssd | ส่งไว ไม่ล้มเหลว"
         )
-        embed.set_footer(text="บอทของคุณนัด | discord.gg/room05280")
-        await ctx.send(embed=embed, delete_after=10)
-        return False
-    return True
-
-@bot.command(name='c')
-async def roblox_lookup(ctx, *, username):
-    if not await check_channel(ctx):
-        return
-
-    user_mention = ctx.author.mention
-    await ctx.send(f"🔍 **{user_mention}** กำลังค้นหาโปรไฟล์ Roblox... ⏳")
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            # 1. หา User ID
-            users_url = 'https://users.roblox.com/v1/usernames/users'
-            payload = {'usernames': [username], 'excludeBannedUsers': True}
-            async with session.post(users_url, json=payload) as resp:
-                users_data = await resp.json()
-
-            if not users_data.get('data'):
-                await ctx.send(f'❌ **{user_mention}** ไม่พบผู้ใช้: `{username}`')
-                return
-
-            user = users_data['data'][0]
-            user_id = user['id']
-            display_name = user.get('displayName', username)
-
-            # 2. ดึงข้อมูลพื้นฐาน
-            async with session.get(f'https://users.roblox.com/v1/users/{user_id}') as resp:
-                profile_data = await resp.json()
-            
-            async with session.get(f'https://friends.roblox.com/v1/users/{user_id}/friends/count') as resp:
-                friends_data = await resp.json()
-            
-            async with session.get(f'https://friends.roblox.com/v1/users/{user_id}/followers/count') as resp:
-                followers_data = await resp.json()
-
-            # เรียก async functions
-            robux_text = await get_robux(user_id)
-            avatar_info, avatar_cost = await get_avatar_cost(user_id)
-
-            description = profile_data.get('description', 'ไม่มีคำอธิบาย')
-            created = profile_data.get('created')
-            friends_count = friends_data.get('count', 0)
-            followers_count = followers_data.get('count', 0)
-
-            # 3. Groups + Status
-            async with session.get(f'https://groups.roblox.com/v1/users/{user_id}/groups/roles') as resp:
-                groups_data = await resp.json()
-            
-            async with session.post('https://presence.roblox.com/v1/presence/users', 
-                                   json={'userIds': [user_id]}) as resp:
-                presence_data = await resp.json()
-
-            groups_list = [g['group']['name'] for g in groups_data.get('data', [])[:5]]
-
-            status_text = "🔴 ออฟไลน์"
-            if presence_data.get('userPresences'):
-                presence = presence_data['userPresences'][0]
-                presence_type = presence.get('userPresenceType', 0)
-                game_instance_id = presence.get('gameInstanceId')
-                place_id = presence.get('placeId')
-                if game_instance_id and place_id:
-                    status_text = f"🟡 เล่นเกม (Place: {place_id})"
-                elif presence_type == 3:
-                    status_text = "🔵 ใน Studio"
-                elif presence_type == 1:
-                    status_text = "🟢 ออนไลน์"
-
-        # รูปโปรไฟล์
-        profile_image_url = await get_profile_image(user_id)
-
-        # Embed รูปใหญ่
-        profile_embed = discord.Embed(title=f"🖼️ {display_name} - รูปโปรไฟล์")
-        profile_embed.set_image(url=profile_image_url)
-        await ctx.send(embed=profile_embed)
-
-        # ✅ Embed หลัก
-        embed = discord.Embed(title=f"✅ **{user_mention}** | 🔍 {display_name}", color=0x00ff00)
-        embed.set_thumbnail(url=profile_image_url)
-
-        # Row 1
-        embed.add_field(name="👤 ชื่อผู้ใช้", value=f"`{username}`", inline=True)
-        embed.add_field(name="🆔 ID", value=f"`{user_id}`", inline=True)
-        embed.add_field(name="📅 สร้างบัญชี", value=format_date(created), inline=True)
-
-        # Row 2
-        embed.add_field(name="👥 เพื่อน", value=f"`{friends_count:,}`", inline=True)
-        embed.add_field(name="❤️ ติดตาม", value=f"`{followers_count:,}`", inline=True)
-        embed.add_field(name="💰 Robux", value=robux_text, inline=True)
-
-        # Row 3
-        embed.add_field(name="🟢 สถานะ", value=status_text, inline=True)
-
-        # ราคาแต่งตัว
-        embed.add_field(
-            name="💎 ราคาแต่งตัว", 
-            value=f"`{avatar_cost:,}` Robux", 
-            inline=True
-        )
-
-        # แสดงรายการแต่งตัว
-        embed.add_field(
-            name="👗 แต่งตัวปัจจุบัน", 
-            value=avatar_info[:1024] or 'ไม่มีข้อมูล', 
-            inline=False
-        )
-
-        # ข้อมูลเพิ่มเติม
-        embed.add_field(name="📝 คำอธิบาย", 
-                       value=description[:1000] + '...' if len(description) > 1000 else description or 'ไม่มี', 
-                       inline=False)
-
-        groups_text = ', '.join(groups_list) if groups_list else 'ไม่มี'
-        embed.add_field(name="🏛️ กลุ่ม", value=groups_text, inline=False)
-
-        embed.add_field(name="🔗 โปรไฟล์", 
-                       value=f"[👉 ดูที่นี่](https://www.roblox.com/users/{user_id}/profile)", 
-                       inline=False)
-
-        embed.set_footer(
-            text="บอทของคุณนัด ไม่อนุญาตให้นำไปใช้ในเซิฟเวอร์ที่ไม่ได้รับอนุญาติ | discord.gg/room05280\n💎 คำนวณราคาแต่งตัวจาก Roblox Catalog API",
-            icon_url="https://cdn.discordapp.com/embed/avatars/0.png"
-        )
-
-        await ctx.send(embed=embed)
-
-    except Exception as e:
-        await ctx.send(f'❌ **{user_mention}** เกิดข้อผิดพลาด: `{str(e)[:1000]}`')
-        print(f"Error detail: {e}")
+    )
 
 bot.run(TOKEN)
